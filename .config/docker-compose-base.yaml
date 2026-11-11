@@ -1,7 +1,7 @@
 services:
   grafana:
     user: root
-    container_name: 'png-iiot-services-datasource'
+    container_name: 'png-zenon-datasource'
 
     build:
       context: .
@@ -13,13 +13,13 @@ services:
     ports:
       - 3000:3000/tcp
     volumes:
-      - ../dist:/var/lib/grafana/plugins/png-iiot-services-datasource
+      - ../dist:/var/lib/grafana/plugins/png-zenon-datasource
       - ../provisioning:/etc/grafana/provisioning
-      - ..:/root/png-iiot-services-datasource
+      - ..:/root/png-zenon-datasource
 
     environment:
       NODE_ENV: development
-      GF_LOG_FILTERS: plugin.png-iiot-services-datasource:debug
+      GF_LOG_FILTERS: plugin.png-zenon-datasource:debug
       GF_LOG_LEVEL: debug
       GF_DATAPROXY_LOGGING: 1
-      GF_PLUGINS_ALLOW_LOADING_UNSIGNED_PLUGINS: png-iiot-services-datasource
+      GF_PLUGINS_ALLOW_LOADING_UNSIGNED_PLUGINS: png-zenon-datasource

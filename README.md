@@ -9,13 +9,13 @@ which is no longer maintained. Differences from upstream:
 
 | | Upstream (1.3.0) | This fork (2.x) |
 | --- | --- | --- |
-| Plugin id | `copadata-iiot-services-datasource` | `png-iiot-services-datasource` |
+| Plugin id | `copadata-iiot-services-datasource` | `png-zenon-datasource` |
 | Tooling | `@grafana/toolkit` (Grafana 8.3) | `@grafana/create-plugin` (Grafana 13) |
 | Grafana | `>= 8.3` | `>= 13.1` |
 | Distribution | `dist/` committed to git | versioned GitHub Releases (zip + SHA-256), built by CI |
 
 The query model is unchanged, so dashboards built with the upstream plugin keep working once their
-datasource `type` is changed to `png-iiot-services-datasource` (see [CHANGELOG](CHANGELOG.md)).
+datasource `type` is changed to `png-zenon-datasource` (see [CHANGELOG](CHANGELOG.md)).
 
 > **Note:** the upstream code was provided by COPA-DATA "as is", not covered by COPA-DATA's support and
 > product lifecycle, under the MIT license. This fork is not affiliated with or supported by COPA-DATA.
@@ -42,13 +42,13 @@ To show alarm and event entries, the usage of Grafana's table panel is recommend
 
 
 ## Installation
-1. Download `png-iiot-services-datasource-<version>.zip` from the
+1. Download `png-zenon-datasource-<version>.zip` from the
    [Releases](https://github.com/Private-National-Grid/grafana-iiot-services-api-datasource/releases) page and
    check it against the `.sha256` file published next to it.
 2. Unzip it into Grafana's plugin folder (e.g. `/var/lib/grafana/plugins/`), giving
-   `.../plugins/png-iiot-services-datasource/`.
+   `.../plugins/png-zenon-datasource/`.
 3. The plugin is unsigned, so allow it explicitly:
-   `GF_PLUGINS_ALLOW_LOADING_UNSIGNED_PLUGINS=png-iiot-services-datasource`
+   `GF_PLUGINS_ALLOW_LOADING_UNSIGNED_PLUGINS=png-zenon-datasource`
    (or `allow_loading_unsigned_plugins` in `grafana.ini`).
 
 
@@ -109,7 +109,7 @@ allow_sign_up=true
 send_client_credentials_via_post=true
 
 [plugins]
-allow_loading_unsigned_plugins=png-iiot-services-datasource
+allow_loading_unsigned_plugins=png-zenon-datasource
 ```
 
 **Hint:** When Grafana is being operated using Docker, please refer to the Grafana documentation (https://grafana.com/docs/grafana/latest/installation/configure-docker/) how to provide configuration options via environment variables.
@@ -192,7 +192,7 @@ npm run e2e          # Playwright smoke tests against `npm run server`
 1. Bump `version` in `package.json` (and `package-lock.json`) and add a `CHANGELOG.md` entry.
 2. Merge to `master`, then tag: `git tag v2.0.1 && git push origin v2.0.1`.
 3. The *Release* workflow builds, tests, and publishes
-   `png-iiot-services-datasource-<version>.zip` plus `.zip.sha256` as a GitHub Release.
+   `png-zenon-datasource-<version>.zip` plus `.zip.sha256` as a GitHub Release.
 
 The tag must match `package.json`'s version or the release job fails.
 

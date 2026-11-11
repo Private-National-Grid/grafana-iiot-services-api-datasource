@@ -4,7 +4,7 @@ apiVersion: 1
 
 datasources:
   - name: 'zenon IIoT Services'
-    type: 'png-iiot-services-datasource'
+    type: 'png-zenon-datasource'
     access: proxy
     url: https://host.docker.internal:9443/iiot-api
     isDefault: true

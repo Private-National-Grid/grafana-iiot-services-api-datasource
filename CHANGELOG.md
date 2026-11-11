@@ -3,8 +3,8 @@
 PNG fork of the COPA-DATA plugin. **Breaking:** new plugin id.
 
 ### Breaking changes
-* Plugin id renamed `copadata-iiot-services-datasource` → `png-iiot-services-datasource`. Provisioned
-  datasources need `type: png-iiot-services-datasource`, dashboards that reference the datasource by
+* Plugin id renamed `copadata-iiot-services-datasource` → `png-zenon-datasource`. Provisioned
+  datasources need `type: png-zenon-datasource`, dashboards that reference the datasource by
   `type` need the same change, and `GF_PLUGINS_ALLOW_LOADING_UNSIGNED_PLUGINS` must list the new id.
   The query model is unchanged, so saved panel queries keep working.
 * Requires Grafana 13.1 or later.

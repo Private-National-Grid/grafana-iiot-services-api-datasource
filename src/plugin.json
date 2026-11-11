@@ -2,7 +2,7 @@
   "$schema": "https://raw.githubusercontent.com/grafana/grafana/main/docs/sources/developers/plugins/plugin.schema.json",
   "type": "datasource",
   "name": "zenon IIoT Services (PNG)",
-  "id": "png-iiot-services-datasource",
+  "id": "png-zenon-datasource",
   "metrics": true,
   "info": {
     "description": "Archive data, online values, alarms and events from the zenon IIoT Services API",
