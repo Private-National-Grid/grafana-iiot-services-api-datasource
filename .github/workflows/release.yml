@@ -1,0 +1,79 @@
+# Builds and publishes a release when a version tag (v1.2.3) is pushed.
+# Assets: <plugin-id>-<version>.zip (unpacks to <plugin-id>/) and <zip>.sha256.
+# Consumers (e.g. the mulilo-l2-scada-iiot repo) pin a tag + sha256 and vendor the unpacked folder.
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions: read-all
+
+jobs:
+  release:
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js environment
+        uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Check tag matches package.json version
+        run: |
+          PKG_VERSION="$(node -p "require('./package.json').version")"
+          if [ "v${PKG_VERSION}" != "${GITHUB_REF_NAME}" ]; then
+            echo "::error::Tag ${GITHUB_REF_NAME} does not match package.json version ${PKG_VERSION}"
+            exit 1
+          fi
+
+      - name: Check types
+        run: npm run typecheck
+      - name: Lint
+        run: npm run lint
+      - name: Unit tests
+        run: npm run test:ci
+        timeout-minutes: 5
+      - name: Build
+        run: npm run build
+
+      - name: Package
+        id: package
+        run: |
+          PLUGIN_ID="$(jq -r .id dist/plugin.json)"
+          VERSION="$(jq -r .info.version dist/plugin.json)"
+          ARCHIVE="${PLUGIN_ID}-${VERSION}.zip"
+          mv dist "${PLUGIN_ID}"
+          # strip build timestamps so the zip is easier to reproduce
+          find "${PLUGIN_ID}" -exec touch -d "@${SOURCE_DATE_EPOCH:-$(git log -1 --format=%ct)}" {} +
+          zip -qrX "${ARCHIVE}" "${PLUGIN_ID}"
+          sha256sum "${ARCHIVE}" > "${ARCHIVE}.sha256"
+          cat "${ARCHIVE}.sha256"
+          echo "archive=${ARCHIVE}" >> "$GITHUB_OUTPUT"
+
+      - name: Validate plugin
+        run: |
+          docker run --pull=always -v "$PWD/${ARCHIVE}:/archive.zip" \
+            grafana/plugin-validator-cli -analyzer=metadatavalid /archive.zip
+        env:
+          ARCHIVE: ${{ steps.package.outputs.archive }}
+
+      - name: Publish GitHub Release
+        run: |
+          NOTES="$(awk '/^# /{n++} n==1' CHANGELOG.md)"
+          gh release create "${GITHUB_REF_NAME}" "${ARCHIVE}" "${ARCHIVE}.sha256" \
+            --title "${GITHUB_REF_NAME}" --notes "${NOTES}" --verify-tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARCHIVE: ${{ steps.package.outputs.archive }}

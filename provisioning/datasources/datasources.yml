@@ -1,0 +1,16 @@
+# Used by `npm run server` and the e2e tests. Points at a local IIoT Services API;
+# the e2e tests only exercise the config editor and do not need it to be reachable.
+apiVersion: 1
+
+datasources:
+  - name: 'zenon IIoT Services'
+    type: 'png-zenon-datasource'
+    access: proxy
+    url: https://host.docker.internal:9443/iiot-api
+    isDefault: true
+    orgId: 1
+    version: 1
+    editable: true
+    jsonData:
+      tlsSkipVerify: true
+      showOfflineDatasources: false

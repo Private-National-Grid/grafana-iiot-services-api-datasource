@@ -1,18 +1,125 @@
 import {
+  createDataFrame,
+  DataFrame,
   DataQueryRequest,
   DataQueryResponse,
   DataSourceApi,
   DataSourceInstanceSettings,
   FieldType,
   MetricFindValue,
-  MutableDataFrame,
   ScopedVars,
-
+  TestDataSourceResponse,
 } from '@grafana/data';
+import { getBackendSrv, getTemplateSrv, isFetchError } from '@grafana/runtime';
+import { lastValueFrom } from 'rxjs';
 
-import { DataSourceQuery, SGApiDataSourceOptions, DataSourceQueryType, TemplateVariableQuery, TemplateVariableQueryType, DataOrigin } from './types';
+import {
+  DataOrigin,
+  DataSourceQuery,
+  DataSourceQueryType,
+  defaultQuery,
+  Option,
+  SGApiDataSourceOptions,
+  TemplateVariableQuery,
+  TemplateVariableQueryType,
+  withDefaults,
+} from './types';
 
-import { getBackendSrv, getTemplateSrv } from "@grafana/runtime"
+/**
+ * Turns what the user typed into a zenon variable-name filter.
+ * Matches anywhere in the name; `*` inside the text is a wildcard:
+ * "" -> "*", "INV" -> "*INV*", "INV*PAC" -> "*INV*PAC*".
+ */
+export function toNamePattern(input?: string): string {
+  const typed = (input ?? '').trim();
+  return typed === '' ? '*' : ('*' + typed + '*').replace(/\*+/g, '*');
+}
+
+/** Case-insensitive test of a name against a pattern from toNamePattern(). */
+export function matchesNamePattern(name: string, pattern: string): boolean {
+  const body = pattern
+    .split('*')
+    .map((part) => part.replace(/[.+?^${}()|[\]\\]/g, '\\$&'))
+    .join('.*');
+  return new RegExp('^' + body + '$', 'i').test(name);
+}
+
+/** Converts an API value to a number the way Grafana's old MutableDataFrame parser did. */
+export function toNumber(value: unknown): number | null {
+  if (value === null || value === undefined) {
+    return null;
+  }
+  if (typeof value === 'number') {
+    return value;
+  }
+  if (typeof value === 'boolean') {
+    return value ? 1 : 0;
+  }
+  const text = String(value).trim();
+  if (text === '') {
+    return null;
+  }
+  const n = Number(text);
+  return isNaN(n) ? null : n;
+}
+
+/** Converts an API timestamp (ISO string or epoch ms) to epoch ms, or null. */
+export function toTime(value: unknown): number | null {
+  if (typeof value === 'number') {
+    return value;
+  }
+  if (typeof value === 'string' && value !== '') {
+    const ms = Date.parse(value);
+    return isNaN(ms) ? null : ms;
+  }
+  return null;
+}
+
+/**
+ * Expands template variables in a list of variable names. A multi-value variable used
+ * with the `:json` format expands to a JSON array, which becomes several names.
+ */
+export function expandTemplateVariables(names: string[], scopedVars?: ScopedVars): string[] {
+  const templateSrv = getTemplateSrv();
+  const result: string[] = [];
+  for (const name of names ?? []) {
+    const value = templateSrv.replace(name, scopedVars);
+    if (value.startsWith('["')) {
+      result.push(...(JSON.parse(value) as string[]));
+    } else {
+      result.push(value.replace(/['"]+/g, ''));
+    }
+  }
+  return result;
+}
+
+const byLabel = (a: Option, b: Option) => (a.label > b.label ? 1 : -1);
+
+const INVALID_FORMAT = 'Query Error: Retrieved data has invalid format';
+
+/** Builds a readable message from a failed request (port of the original handleHttpErrors). */
+export function toErrorMessage(err: unknown): string {
+  if (err instanceof Error) {
+    return err.message;
+  }
+  if (isFetchError(err)) {
+    const data = err.data as { errorMessage?: string; variableErrors?: unknown } | undefined;
+    if (err.status === 400) {
+      if (data?.errorMessage !== undefined && data?.variableErrors !== undefined) {
+        return 'Bad Request: ' + data.errorMessage + '; Details: ' + JSON.stringify(data.variableErrors);
+      }
+      return data?.errorMessage ?? 'Bad Request';
+    }
+    if (data?.errorMessage !== undefined) {
+      return data.errorMessage;
+    }
+    if (err.status === 401) {
+      return 'Authorization Error: 401 Unauthorized';
+    }
+    return `${err.status} ${err.statusText ?? ''}`.trim();
+  }
+  return String(err);
+}
 
 export class DataSource extends DataSourceApi<DataSourceQuery, SGApiDataSourceOptions> {
   url: string;
@@ -21,629 +128,330 @@ export class DataSource extends DataSourceApi<DataSourceQuery, SGApiDataSourceOp
   constructor(instanceSettings: DataSourceInstanceSettings<SGApiDataSourceOptions>) {
     super(instanceSettings);
     this.url = instanceSettings.url!;
-    this.showOfflineDatasources = instanceSettings.jsonData.showOfflineDatasources || false;
+    this.showOfflineDatasources = instanceSettings.jsonData.showOfflineDatasources ?? false;
   }
 
-  async query(options: DataQueryRequest<DataSourceQuery>): Promise<DataQueryResponse> {
+  getDefaultQuery(): Partial<DataSourceQuery> {
+    return defaultQuery;
+  }
 
-    let queries: DataSourceQuery[] = options.targets.filter(item => item.hide != true);
-    queries.forEach(item => {
-      item = this.replaceTemplateVariables(item, options.scopedVars);
-    });
+  // ---------------------------------------------------------------- HTTP
 
-    let dateFrom: Date = <Date><unknown>options.range.from;
-    let dateTo: Date = <Date><unknown>options.range.to;
+  /** Raw request through the Grafana proxy; rejects with the FetchError. */
+  private async rawRequest<T>(path: string, method: 'GET' | 'POST', data?: unknown): Promise<T> {
+    const response = await lastValueFrom(
+      getBackendSrv().fetch<T>({ url: this.url + path, method, data, showErrorAlert: false })
+    );
+    return response.data;
+  }
 
-    if (queries.length === 0) {
-      return Promise.resolve({ data: [] });
+  /** Request whose failure carries the "Query Error" message shown in panels. */
+  private async request<T>(path: string, method: 'GET' | 'POST', data?: unknown): Promise<T> {
+    try {
+      return await this.rawRequest<T>(path, method, data);
+    } catch (err) {
+      throw new Error('Query Error: Error during requesting data from API. ' + toErrorMessage(err));
     }
+  }
 
-    let runningQueries = [];
+  // ---------------------------------------------------------------- Panel queries
 
-    for (let query of queries) {
-      // is query valid?
-      if (!query.datasourceId || (query.queryType==DataSourceQueryType.ArchiveData && (!query.archiveFilter.archiveId || query.archiveFilter.variables.length==0)))
-      {
+  async query(options: DataQueryRequest<DataSourceQuery>): Promise<DataQueryResponse> {
+    const from = options.range.from.toISOString();
+    const to = options.range.to.toISOString();
+
+    const queries = options.targets
+      .filter((target) => target.hide !== true)
+      .map((target) => this.applyTemplateVariables(withDefaults(target, defaultQuery), options.scopedVars));
+
+    const running: Array<Promise<DataFrame[]>> = [];
+    for (const query of queries) {
+      if (
+        !query.datasourceId ||
+        (query.queryType === DataSourceQueryType.ArchiveData &&
+          (!query.archiveFilter.archiveId || query.archiveFilter.variables.length === 0))
+      ) {
         continue;
       }
       switch (query.queryType) {
         case DataSourceQueryType.ArchiveData:
-          runningQueries.push(this.queryArchiveValues(query, dateFrom, dateTo));
+          running.push(this.queryArchiveValues(query, from, to));
           break;
         case DataSourceQueryType.Alarms:
         case DataSourceQueryType.Events:
-          runningQueries.push(this.queryAlarmsEvents(query, dateFrom, dateTo))
+          running.push(this.queryAlarmsEvents(query, from, to));
           break;
         case DataSourceQueryType.VariableValues:
-          runningQueries.push(this.queryOnlineValues(query));
+          running.push(this.queryOnlineValues(query));
+          break;
       }
     }
 
-    return Promise.all(runningQueries).then((dataFrames) => {
-
-      return Promise.resolve({data:dataFrames.flat()})
-    })
+    const frames = await Promise.all(running);
+    return { data: frames.flat() };
   }
 
-  replaceTemplateVariables(query:DataSourceQuery, scopedVars:ScopedVars) : DataSourceQuery
-  {
-    
-    query.datasourceId = getTemplateSrv().replace(query.datasourceId, scopedVars);
-    query.archiveFilter.archiveId = getTemplateSrv().replace(query.archiveFilter.archiveId, scopedVars);
+  /** Returns a copy of the query with template variables resolved (the stored query is not touched). */
+  applyTemplateVariables(query: DataSourceQuery, scopedVars: ScopedVars): DataSourceQuery {
+    const templateSrv = getTemplateSrv();
+    return {
+      ...query,
+      datasourceId: templateSrv.replace(query.datasourceId, scopedVars),
+      archiveFilter: {
+        ...query.archiveFilter,
+        archiveId: templateSrv.replace(query.archiveFilter.archiveId, scopedVars),
+        variables: expandTemplateVariables(query.archiveFilter.variables, scopedVars),
+      },
+      alarmsEventsFilter: {
+        ...query.alarmsEventsFilter,
+        variables: expandTemplateVariables(query.alarmsEventsFilter.variables, scopedVars),
+      },
+      variableFilter: {
+        ...query.variableFilter,
+        variables: expandTemplateVariables(query.variableFilter.variables, scopedVars),
+      },
+    };
+  }
 
-    const expandTemplateVars = (array:string[]): string[] =>{
-      let result : string[] = [];
-      for (let v of array)
-      {
-        let value = getTemplateSrv().replace(v, scopedVars);
-        // is this a multi-value variable
-        if (value.substr(0,2) == '["')
-        {
-          result = result.concat(JSON.parse(value));
-        }
-        else
-        {
-            result.push(value.replace(/['"]+/g, ''));
-        }
-      }
-      return result;
+  async queryArchiveValues(query: DataSourceQuery, from: string, to: string): Promise<DataFrame[]> {
+    const path = `/api/v2/datasources/${query.datasourceId}/archives/${query.archiveFilter.archiveId}/query`;
+    const body = {
+      variableFilter: { variableNames: query.archiveFilter.variables },
+      timeFilter: { from, to, type: 'Absolute' },
+      origin: query.archiveFilter.origin,
+    };
+    const data = await this.request<any>(path, 'POST', body);
+    if (!data || !Array.isArray(data.variables)) {
+      throw new Error(INVALID_FORMAT);
     }
-    
-    query.archiveFilter.variables=expandTemplateVars(query.archiveFilter.variables);
-    query.alarmsEventsFilter.variables=expandTemplateVars(query.alarmsEventsFilter.variables);
-    query.variableFilter.variables=expandTemplateVars(query.variableFilter.variables);
-    return query;
+
+    return data.variables.map((entry: any) => {
+      const name = entry?.archiveVariable?.variableName;
+      if (name === undefined) {
+        throw new Error(INVALID_FORMAT);
+      }
+      const values: any[] = entry.values ?? [];
+      return createDataFrame({
+        refId: query.refId,
+        fields: [
+          { name, type: FieldType.number, values: values.map((v) => toNumber(v.value)) },
+          { name: 'time', type: FieldType.time, values: values.map((v) => toTime(v.timestamp)) },
+        ],
+      });
+    });
   }
 
-  async metricFindQuery(query: TemplateVariableQuery, options?: any) : Promise<MetricFindValue[]>{
-    
-    let regex = new RegExp("");
+  async queryOnlineValues(query: DataSourceQuery): Promise<DataFrame[]> {
+    const path = `/api/v1/datasources/${query.datasourceId}/variables/query`;
+    const body = {
+      nameFilter: { variableNames: query.variableFilter.variables },
+      fields: ['name', 'value', 'lastUpdateTime'],
+    };
+    const data = await this.request<any>(path, 'POST', body);
+    if (!data || !Array.isArray(data.variables)) {
+      throw new Error(INVALID_FORMAT);
+    }
+
+    return data.variables.map((entry: any) =>
+      createDataFrame({
+        refId: query.refId,
+        fields: [
+          { name: entry.name, type: FieldType.number, values: [toNumber(entry.value)] },
+          { name: 'time', type: FieldType.time, values: [toTime(entry.lastUpdateTime)] },
+        ],
+      })
+    );
+  }
+
+  async queryAlarmsEvents(query: DataSourceQuery, from: string, to: string): Promise<DataFrame[]> {
+    const isAlarms = query.queryType === DataSourceQueryType.Alarms;
+    const path = `/api/v1/datasources/${query.datasourceId}/${isAlarms ? 'alarms' : 'events'}/query`;
+
+    const body: Record<string, unknown> = {
+      timeFilter: { from, to, type: 'Absolute' },
+      variableFilter: { variableNames: query.alarmsEventsFilter.variables },
+    };
+    if (isAlarms) {
+      const flags: string[] = [];
+      if (query.alarmsEventsFilter.onlyActive) {
+        flags.push('OnlyActive');
+      }
+      if (query.alarmsEventsFilter.onlyCleared) {
+        flags.push('OnlyCleared');
+      }
+      if (query.alarmsEventsFilter.onlyUnacknowledged) {
+        flags.push('OnlyUnacknowledged');
+      }
+      if (flags.length > 0) {
+        body.filterFlags = flags;
+      }
+    }
+
+    const data = await this.request<any>(path, 'POST', body);
+    const items: any[] | undefined = isAlarms ? data?.alarms : data?.events;
+    if (!Array.isArray(items)) {
+      throw new Error(INVALID_FORMAT);
+    }
+
+    const column = (name: string, displayName: string, type: FieldType, pick: (item: any) => unknown) => ({
+      name,
+      type,
+      config: { displayName },
+      values: items.map((item) => pick(item) ?? null),
+    });
+    const user = (item: any) => item.username || item.userFullName || null;
+
+    const fields = [
+      column('id', 'Id', FieldType.string, (i) => i.id),
+      column('variableName', 'Variable Name', FieldType.string, (i) => i.variableName),
+      column('value', 'Value', FieldType.other, (i) => i.value),
+      column('text', 'Text', FieldType.string, (i) => i.text),
+      column('comment', 'Comment', FieldType.string, (i) => i.comment),
+      column('receivedTime', 'Time Received', FieldType.time, (i) => toTime(i.receivedTime)),
+      ...(isAlarms
+        ? [
+            column('clearedTime', 'Time Cleared', FieldType.time, (i) => toTime(i.clearedTime)),
+            column('acknowledgedTime', 'Time Acknowledged', FieldType.time, (i) => toTime(i.acknowledgedTime)),
+            column('computer', 'Computer', FieldType.string, (i) => i.computer),
+            column('acknowledgedBy', 'Acknowledged by', FieldType.string, user),
+          ]
+        : [
+            column('computer', 'Computer', FieldType.string, (i) => i.computer),
+            column('user', 'User', FieldType.string, user),
+          ]),
+    ];
+
+    return [createDataFrame({ refId: query.refId, fields })];
+  }
+
+  // ---------------------------------------------------------------- Lookups (editors + template variables)
+
+  async findDataSources(): Promise<Option[]> {
+    const data = await this.request<any>('/api/v2/datasources', 'GET');
+    const list = data?.dataSourcesOrigin;
+    if (!Array.isArray(list)) {
+      throw new Error('Query Error: Could not parse list of data sources');
+    }
+
+    const result: Option[] = [];
+    for (const ds of list) {
+      if (!('dataSourceId' in ds) || !('name' in ds) || !('dataOrigin' in ds)) {
+        throw new Error('Query Error: Unknown/Invalid format');
+      }
+      // Hide data sources where neither origin (Data Storage / Service Engine) is available,
+      // unless the datasource is configured to show offline ones.
+      const origins = ds.dataOrigin as Array<{ type: string; state: string }>;
+      if (!this.showOfflineDatasources && !origins.some((o) => o.state === 'Available')) {
+        continue;
+      }
+      result.push({ label: ds.name, value: ds.dataSourceId });
+    }
+    return result.sort(byLabel);
+  }
+
+  async findArchives(datasourceId: string | undefined, origin: DataOrigin = DataOrigin.DataStorage): Promise<Option[]> {
+    if (!datasourceId) {
+      return [];
+    }
+    const id = getTemplateSrv().replace(datasourceId);
+
+    let data: any;
     try {
-      regex = new RegExp(query.regexString, "i");
-    } catch (e) {
-      console.error(query.regexString + " has invalid regex pattern. Ignore regex filter.");
+      data = await this.request<any>(`/api/v2/datasources/${id}/archives`, 'GET');
+    } catch {
+      return []; // as upstream: an unknown/unreachable datasource just has no archives
+    }
+    if (!Array.isArray(data?.archives)) {
+      throw new Error('Query Error: Could not parse list of archives');
     }
 
-    switch(query.queryType)
-    {
+    const archives: Option[] = [];
+    const extract = (list: any[], aggregated: boolean) => {
+      for (const arch of list) {
+        if (!('identification' in arch) || !('name' in arch)) {
+          throw new Error('Query Error: Unknown/Invalid format');
+        }
+        // only list the archive if it exists in the selected data origin
+        if ((arch.dataOrigin as string[] | undefined)?.includes(origin)) {
+          archives.push({ label: (aggregated ? '- aggregated - ' : '') + arch.name, value: arch.identification });
+        }
+        if (Array.isArray(arch.aggregatedArchives)) {
+          extract(arch.aggregatedArchives, true);
+        }
+      }
+    };
+    extract(data.archives, false);
+
+    // sort by name, ignoring the "aggregated" prefix
+    const bare = (label: string) => label.replace(/- aggregated - /, '');
+    return archives.sort((a, b) => (bare(a.label) > bare(b.label) ? 1 : -1));
+  }
+
+  async findVariablesForArchive(datasourceId: string | undefined, archiveId: string | undefined): Promise<Option[]> {
+    if (!datasourceId || !archiveId) {
+      return [];
+    }
+    const templateSrv = getTemplateSrv();
+    const path = `/api/v2/datasources/${templateSrv.replace(datasourceId)}/archives/${templateSrv.replace(archiveId)}`;
+    const data = await this.request<any>(path, 'GET');
+    if (!Array.isArray(data?.variables)) {
+      throw new Error('Query Error: Could not parse list of variables');
+    }
+    return data.variables
+      .map((item: any): Option => ({ label: item.variableName, value: item.variableName }))
+      .sort(byLabel);
+  }
+
+  /** Variables of a datasource; `nameFilter` is applied on the server (see toNamePattern). */
+  async findVariables(datasourceId: string | undefined, nameFilter?: string): Promise<Option[]> {
+    if (!datasourceId) {
+      return [];
+    }
+    const id = getTemplateSrv().replace(datasourceId);
+    const body = { fields: ['name'], nameFilter: { variableNames: [toNamePattern(nameFilter)] } };
+    const data = await this.request<any>(`/api/v1/datasources/${id}/variables/query`, 'POST', body);
+    if (!Array.isArray(data?.variables)) {
+      throw new Error('Query Error: Could not parse list of variables');
+    }
+    return data.variables.map((v: any): Option => ({ label: v.name, value: v.name })).sort(byLabel);
+  }
+
+  // ---------------------------------------------------------------- Template variables
+
+  async metricFindQuery(query: TemplateVariableQuery): Promise<MetricFindValue[]> {
+    let regex = /(?:)/;
+    try {
+      regex = new RegExp(query.regexString ?? '', 'i');
+    } catch {
+      console.error(query.regexString + ' has invalid regex pattern. Ignore regex filter.');
+    }
+
+    let options: Option[] = [];
+    switch (query.queryType) {
       case TemplateVariableQueryType.Datasources:
-        return this.findDataSources().then((ds) => {
-          let items = [];
-          for (let d of ds){
-            
-            if (d.label.match(regex) == null){
-              console.debug(d.label + " does not match regex " + regex);
-              continue;
-            }
-
-            items.push({text:d.label,value:d.value})
-
-          }
-          return Promise.resolve(items);
-        });
-      break;
+        options = await this.findDataSources();
+        break;
       case TemplateVariableQueryType.ArchivesForDatasource:
-        return this.findArchives(query.datasourceId!).then((ars) => {
-          let items = [];
-          for (let d of ars){
-
-            if (d.label.match(regex) == null){
-              console.debug(d.label + " does not match regex " + regex);
-              continue;
-            }
-
-            items.push({text:d.label,value:d.value})
-
-          }
-          return Promise.resolve(items);
-        });
-      break;
+        options = await this.findArchives(query.datasourceId);
+        break;
       case TemplateVariableQueryType.VariablesForArchive:
-        return this.findVariablesForArchive(query.datasourceId!,query.archiveId!).then((vars) => {
-          let items = [];
-          for (let d of vars){
-
-            if (d.label.match(regex) == null){
-              console.debug(d.label + " does not match regex " + regex);
-              continue;
-            }
-
-            items.push({text:d.label,value:d.value})
-            
-          }
-          return Promise.resolve(items);
-        });
+        options = await this.findVariablesForArchive(query.datasourceId, query.archiveId);
         break;
-        case TemplateVariableQueryType.VariablesForDatasource:
-        return this.findVariables(query.datasourceId!).then((vars) => {
-          let items = [];
-          for (let d of vars){
-
-            if (d.label.match(regex) == null){
-              console.debug(d.label + " does not match regex " + regex);
-              continue;
-            }
-
-            items.push({text:d.label,value:d.value})
-            
-          }
-          return Promise.resolve(items);
-        });
+      case TemplateVariableQueryType.VariablesForDatasource:
+        options = await this.findVariables(query.datasourceId);
         break;
     }
+    return options.filter((o) => regex.test(o.label)).map((o) => ({ text: o.label, value: o.value }));
   }
 
-  async testDatasource() {
+  // ---------------------------------------------------------------- Health check
 
-    return getBackendSrv().datasourceRequest({
-      url: this.url + "/",
-      method: 'GET'
-    }).then((data: any) => {
-      return Promise.resolve({
-        status: 'success',
-        message: 'Connection test successful',
-      });
-    }, (err: any) => {
-      return Promise.resolve({
-        status: 'error',
-        message: 'Error: ' + err.status + ' ' + err.statusText,
-      });
-
-    });
-  }
-
-  queryArchiveValues(query: DataSourceQuery, dateFrom: Date, dateTo: Date): Promise<MutableDataFrame[]> {
-
-    let requestUrl = this.url + "/api/v2/datasources/" + query.datasourceId + "/archives/" + query.archiveFilter.archiveId + "/query";
-    let variableList = query.archiveFilter.variables;
-    let requestBody = {
-      variableFilter: {
-        variableNames: variableList
-      },
-      timeFilter: {
-        from: dateFrom.toISOString(),
-        to: dateTo.toISOString(),
-        type: "Absolute"
-      },
-      origin: query.archiveFilter.origin
-    };
-
-    return getBackendSrv().datasourceRequest({
-      url: requestUrl,
-      data: requestBody,
-      method: 'POST'
-    }).then((response) => {
-
-      if (!('data' in response) || !('variables' in response.data)) {
-        throw { data: { message: 'Query Error: Retrieved data has invalid format' } };
-      }
-
-      let variables = response.data.variables;
-
-      let dataFrames = []
-
-      // iterate through all variable entries of this response
-      for (let variableEntry of variables) {
-
-        const dataFrame = new MutableDataFrame({
-          refId: query.refId,
-          fields: [
-            { name: variableEntry.archiveVariable.variableName, type: FieldType.number},
-            { name: 'time', type: FieldType.time }
-          ],
-        });
-
-        for (let valueEntry of variableEntry.values) {
-          let timestamp = Date.parse(valueEntry.timestamp);
-          let value = valueEntry.value;
-          if (!isNaN(value)) {
-            value = Number(value);
-          }
-          dataFrame.add({
-            time: timestamp,
-            [variableEntry.archiveVariable.variableName]: value
-          });
-        }
-
-        if (!('archiveVariable' in variableEntry) || !('variableName' in variableEntry.archiveVariable)) {
-          throw { data: { message: 'Query Error: Retrieved data has invalid format' } };
-        }
-        dataFrames.push(dataFrame)        
-      }
-
-      return Promise.resolve(dataFrames);
-
-    }, this.handleHttpErrors).catch(this.handleQueryException);
-
-  }
-
-  queryOnlineValues(query: DataSourceQuery): Promise<MutableDataFrame[]> {
-
-    let requestUrl = this.url + "/api/v1/datasources/" + query.datasourceId + "/variables/query";
-    let variableList = query.variableFilter.variables;
-
-    let requestBody = {
-      nameFilter: {
-        variableNames: variableList
-      },
-      fields: ["name","value","lastUpdateTime"]
-    };
-
-    return getBackendSrv().datasourceRequest({
-      url: requestUrl,
-      data: requestBody,
-      method: 'POST'
-    }).then((response) => {
-
-      if (!('data' in response) || !('variables' in response.data)) {
-        throw { data: { message: 'Query Error: Retrieved data has invalid format' } };
-      }
-
-      let variables = response.data.variables;
-      
-      let dataFrames = []
-
-      // iterate through all variable entries of this response
-      for (let variableEntry of variables) {
-
-        const dataFrame = new MutableDataFrame({
-          refId: query.refId,
-          fields: [
-            { name: variableEntry.name, type: FieldType.number},
-            { name: 'time', type: FieldType.time }
-          ],
-        });
-
-        dataFrame.add({
-          time: variableEntry.lastUpdateTime,
-          [variableEntry.name]: variableEntry.value
-        });
-
-        dataFrames.push(dataFrame);
-      }
-
-      return Promise.resolve(dataFrames);
-
-    }, this.handleHttpErrors).catch(this.handleQueryException);
-
-  }
-
-  queryAlarmsEvents(query: DataSourceQuery, dateFrom: Date, dateTo: Date) : Promise<MutableDataFrame[]> {
-
-    let requestUrl = this.url + "/api/v1/datasources/" + query.datasourceId;
-    if (query.queryType == DataSourceQueryType.Alarms)
-      requestUrl = requestUrl + "/alarms/query";
-    else if (query.queryType == DataSourceQueryType.Events)
-      requestUrl = requestUrl + "/events/query";
-
-    let requestBody: any = {
-      timeFilter: {
-        from: dateFrom.toISOString(),
-        to: dateTo.toISOString(),
-        type: "Absolute"
-      },
-      variableFilter: {
-        variableNames: query.alarmsEventsFilter.variables
-      }
+  async testDatasource(): Promise<TestDataSourceResponse> {
+    try {
+      await this.rawRequest('/', 'GET');
+      return { status: 'success', message: 'Connection test successful' };
+    } catch (err) {
+      return { status: 'error', message: 'Error: ' + toErrorMessage(err) };
     }
-    
-    // filtering specific for alarms
-    if (query.alarmsEventsFilter !== undefined && query.queryType == DataSourceQueryType.Alarms) {
-      let filterFlags: any[] = [];
-      if (query.alarmsEventsFilter.onlyActive)
-        filterFlags.push("OnlyActive");
-      if (query.alarmsEventsFilter.onlyCleared)
-        filterFlags.push("OnlyCleared");
-      if (query.alarmsEventsFilter.onlyUnacknowledged)
-        filterFlags.push("OnlyUnacknowledged");
-      if (filterFlags.length > 0)
-        requestBody['filterFlags'] = filterFlags;
-    }
-
-    return getBackendSrv().datasourceRequest({
-      url: requestUrl,
-      data: requestBody,
-      method: 'POST'
-    }).then((response) => {
-
-      if (!('data' in response) ||
-        (query.queryType == DataSourceQueryType.Alarms && !('alarms' in response.data)) ||
-        (query.queryType == DataSourceQueryType.Events && !('events' in response.data))) {
-        throw { data: { message: 'Query Error: Retrieved data has invalid format' } };
-      }
-
-      let items = [];
-
-      if ('alarms' in response.data)
-        items = response.data.alarms;
-      else if ('events' in response.data)
-        items = response.data.events;
-
-      let dataFrame = undefined;
-
-      switch (query.queryType) {
-        default:
-        case DataSourceQueryType.Alarms:
-          const alarmsDataFrame = new MutableDataFrame({
-            refId: query.refId,
-            fields: [
-              { name: 'id', type: FieldType.string, config: { displayName: 'Id' } },
-              { name: 'variableName', type: FieldType.string, config: { displayName: 'Variable Name' } },
-              { name: 'value', type: FieldType.other, config: { displayName: 'Value' } },
-              { name: 'text', type: FieldType.string, config: { displayName: 'Text' } },
-              { name: 'comment', type: FieldType.string, config: { displayName: 'Comment' } },
-              { name: 'receivedTime', type: FieldType.time, config: { displayName: 'Time Received' } },
-              { name: 'clearedTime', type: FieldType.time, config: { displayName: 'Time Cleared' } },
-              { name: 'acknowledgedTime', type: FieldType.time, config: { displayName: 'Time Acknowledged' } },
-              { name: 'computer', type: FieldType.string, config: { displayName: 'Computer' } },
-              { name: 'acknowledgedBy', type: FieldType.string, config: { displayName: 'Acknowledged by' } },
-            ]
-          })
-
-          for (let item of items) {
-            alarmsDataFrame.add({
-              id: item.id || null,
-              variableName: item.variableName || null,
-              value: item.value || null,
-              text: item.text || null,
-              comment: item.comment || null,
-              receivedTime: Date.parse(item.receivedTime) || null,
-              clearedTime: Date.parse(item.clearedTime) || null,
-              acknowledgedTime: Date.parse(item.acknowledgedTime) || null,
-              computer: item.computer || null,
-              acknowledgedBy: item.username || item.userFullName || null
-            })
-          }
-
-          dataFrame = alarmsDataFrame;
-          break;
-
-        case DataSourceQueryType.Events:
-          const eventsDataFrame = new MutableDataFrame({
-            refId: query.refId,
-            fields: [
-              { name: 'id', type: FieldType.string, config: { displayName: 'Id' } },
-              { name: 'variableName', type: FieldType.string, config: { displayName: 'Variable Name' } },
-              { name: 'value', type: FieldType.other, config: { displayName: 'Value' } },
-              { name: 'text', type: FieldType.string, config: { displayName: 'Text' } },
-              { name: 'comment', type: FieldType.string, config: { displayName: 'Comment' } },
-              { name: 'receivedTime', type: FieldType.time, config: { displayName: 'Time Received' } },
-              { name: 'computer', type: FieldType.string, config: { displayName: 'Computer' } },
-              { name: 'user', type: FieldType.string, config: { displayName: 'User' } },
-            ]
-          })
-
-          for (let item of items) {
-            eventsDataFrame.add({
-              id: item.id || null,
-              variableName: item.variableName || null,
-              value: item.value || null,
-              text: item.text || null,
-              comment: item.comment || null,
-              receivedTime: Date.parse(item.receivedTime) || null,
-              computer: item.computer || null,
-              user: item.username || item.userFullName || null
-            })
-          }
-
-          dataFrame = eventsDataFrame;
-          break;
-      }
-
-      return Promise.resolve([dataFrame]);
-
-    }, this.handleHttpErrors).catch(this.handleQueryException);
-
   }
-
-  findDataSources() : Promise<{label:string,value:string}[]> {
-
-    return getBackendSrv().datasourceRequest({
-      url: this.url + "/api/v2/datasources",
-      method: 'GET'
-    }).then((res: any) => {
-
-      let datasources = [];
-
-      if (!("dataSourcesOrigin" in res.data)) {
-        throw { data: { message: "Query Error: Could not parse list of data sources" } };
-      }
-
-      let responseDataSources = res.data.dataSourcesOrigin;
-
-      if (responseDataSources === undefined || responseDataSources instanceof Array == false) {
-        throw { data: { message: "Query Error: Could not parse list of data sources" } };
-      }
-
-      for (let ds of responseDataSources) {
-        if (!('dataSourceId' in ds) || !('name' in ds) || !('dataOrigin' in ds)) {
-          throw { data: { message: "Query Error: Unknown/Invalid format" } };
-        }
-
-        // ignore datasources where none of the data origins (Data Storage or Serivce Engine) is currently available
-        // only do so if the respective datasource wide setting is not configured
-        let dataOrigins = ds.dataOrigin as [{type: string, state: string}];
-        if (dataOrigins.filter(d => d.state == "Available").length == 0 && !this.showOfflineDatasources) {
-          continue;
-        }
-
-        let dsObj = { "label": ds.name, "value": ds.dataSourceId };
-        datasources.push(dsObj);
-      }
-
-      datasources.sort((a, b) => (a.label > b.label) ? 1 : -1);
-
-      return Promise.resolve(datasources);
-
-    }, this.handleHttpErrors).catch(this.handleQueryException);
-
-  }
-
-  findArchives(datasourceId: string, dataorigin: DataOrigin = DataOrigin.DataStorage) : Promise<{label:string,value:string}[]> {
-
-    if (datasourceId == undefined || datasourceId == '') {
-      return Promise.resolve([]);
-    }
-
-    datasourceId = getTemplateSrv().replace(datasourceId);
-
-    return getBackendSrv().datasourceRequest({
-      url: this.url + "/api/v2/datasources/" + datasourceId + "/archives",
-      method: 'GET'
-    }).then((res) => {
-
-      let archives: any[] = [];
-
-      if (!("archives" in res.data)) {
-        throw { data: { message: "Query Error: Could not parse list of archives" } };
-      }
-
-      let responseArchives = res.data.archives;
-
-      if (responseArchives === undefined || responseArchives instanceof Array == false) {
-        throw { data: { message: "Query Error: Could not parse list of archives" } };
-      }
-
-      let extractArchives = (archiveArray: [any], isAggregated: boolean) => {
-        for (let arch of archiveArray) {
-          if (!('identification' in arch) || !('name' in arch)) {
-            throw { data: { message: "Query Error: Unknown/Invalid format" } };
-          }
-
-          let displayName = (isAggregated ? "- aggregated - " : "") + arch.name;
-          let archObj = { "label": displayName, "value": arch.identification };
-          
-          // only include the archive in the list, if it is available in the selected data origin
-          if ((<string[]>arch.dataOrigin).indexOf(dataorigin) != -1)
-          {
-            archives.push(archObj);
-          }
-
-          if ('aggregatedArchives' in arch) {
-            extractArchives(arch.aggregatedArchives, true);
-          }
-        }
-      };
-
-      extractArchives(responseArchives, false);
-
-      // sort archives, ignore prefix "AGGREGATED: "
-      archives.sort((a, b) => {
-        return (a.label.replace(/- aggregated - /, '') > b.label.replace(/- aggregated - /, '')) ? 1 : -1;
-      });
-
-      return Promise.resolve(archives);
-
-    },(err:any) => {
-      return Promise.resolve([]);
-    });
-
-  }
-
-  findVariablesForArchive(datasourceId: string, archiveId: string) : Promise<{label:string,value:string}[]> {
-
-    if (datasourceId == undefined || datasourceId == '' || archiveId == undefined || archiveId == '') {
-      return Promise.resolve([]);
-    }
-
-    datasourceId = getTemplateSrv().replace(datasourceId);
-    archiveId = getTemplateSrv().replace(archiveId);
-
-    return getBackendSrv().datasourceRequest({
-      url: this.url + "/api/v2/datasources/" + datasourceId + "/archives/" + archiveId,
-      method: 'GET'
-    }).then((res) => {
-
-      if (!("variables" in res.data)) {
-        throw { data: { message: "Query Error: Could not parse list of variables" } };
-      }
-
-      let responseVariables = res.data.variables;
-
-      if (responseVariables === undefined || responseVariables instanceof Array == false) {
-        throw { data: { message: "Query Error: Could not parse list of variables" } };
-      }
-
-      const variables = responseVariables.map((item: any) => {
-        return { label: item.variableName, value: item.variableName };
-      });
-
-      variables.sort((a: any, b: any) => (a.label > b.label) ? 1 : -1);
-
-      return Promise.resolve(variables);
-
-    }, this.handleHttpErrors).catch(this.handleQueryException);
-
-  }
-
-  findVariables(datasourceId: string) : Promise<{label:string,value:string}[]>{
-
-    if (datasourceId == undefined || datasourceId == '') {
-      return Promise.resolve([]);
-    }
-
-    datasourceId = getTemplateSrv().replace(datasourceId);
-
-    let requestUrl = this.url + "/api/v1/datasources/" + datasourceId + "/variables/query";
-    let requestBody = { fields: ["name"], nameFilter: { variableNames: ["*"] } };
-
-    return getBackendSrv().datasourceRequest({
-      url: requestUrl,
-      data: requestBody,
-      method: 'POST'
-    }).then((res) => {
-
-      if (!("variables" in res.data)) {
-        throw { data: { message: "Query Error: Could not parse list of variables" } };
-      }
-
-      let variables = res.data.variables.map((v: any) => {
-        return { label: v.name, value: v.name };
-      });
-
-      variables.sort((a: any, b: any) => (a.label > b.label) ? 1 : -1);
-
-      return Promise.resolve(variables);
-
-    }, this.handleHttpErrors).catch(this.handleQueryException);
-
-  }
-
-  handleHttpErrors(err: any) {
-
-    if (err.status === 401) {
-      err.message = "Authorization Error: " + err.status + " Unauthorized";
-    }
-
-    if (err.status == 400) {
-      if (err.data !== undefined && err.data.errorMessage !== undefined && err.data.variableErrors !== undefined)
-      {
-        err.message = "Bad Request: " + err.data.errorMessage + "; Details: " + JSON.stringify(err.data.variableErrors);
-      } else {
-        err.message = "Bad Request";
-      }
-    }
-
-    if (err.data !== undefined && err.data.errorMessage !== undefined) {
-      err.message = err.data.errorMessage;
-    }
-
-    throw new Error(err.message);
-
-    return Promise.reject(err);
-  }
-
-  handleQueryException(err: any) {
-    if (('data' in err) && err.data !== undefined) {
-      return Promise.reject(err);
-    }
-
-    // return a rejected promise with the error message
-    return Promise.reject({
-      data: {
-        message: 'Query Error: Error during requesting data from API. ' + err.message
-      }
-    });
-  }
-
 }
