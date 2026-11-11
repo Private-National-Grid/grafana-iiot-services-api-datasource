@@ -7,6 +7,7 @@ import {
   DataSourceInstanceSettings,
   FieldType,
   MetricFindValue,
+  QueryResultMetaNotice,
   ScopedVars,
   TestDataSourceResponse,
 } from '@grafana/data';
@@ -17,6 +18,7 @@ import {
   DataOrigin,
   DataSourceQuery,
   DataSourceQueryType,
+  DEFAULT_SERVICE_ENGINE_FILL_LOOKBACK_HOURS,
   defaultQuery,
   Option,
   SGApiDataSourceOptions,
@@ -97,6 +99,13 @@ const byLabel = (a: Option, b: Option) => (a.label > b.label ? 1 : -1);
 
 const INVALID_FORMAT = 'Query Error: Retrieved data has invalid format';
 
+/** One archive variable's samples, as parallel arrays. */
+interface ArchiveSeries {
+  name: string;
+  values: Array<number | null>;
+  times: Array<number | null>;
+}
+
 /** Builds a readable message from a failed request (port of the original handleHttpErrors). */
 export function toErrorMessage(err: unknown): string {
   if (err instanceof Error) {
@@ -124,11 +133,15 @@ export function toErrorMessage(err: unknown): string {
 export class DataSource extends DataSourceApi<DataSourceQuery, SGApiDataSourceOptions> {
   url: string;
   showOfflineDatasources: boolean;
+  serviceEngineFillLookbackHours: number;
 
   constructor(instanceSettings: DataSourceInstanceSettings<SGApiDataSourceOptions>) {
     super(instanceSettings);
     this.url = instanceSettings.url!;
     this.showOfflineDatasources = instanceSettings.jsonData.showOfflineDatasources ?? false;
+    const lookback = Number(instanceSettings.jsonData.serviceEngineFillLookbackHours);
+    this.serviceEngineFillLookbackHours =
+      Number.isFinite(lookback) && lookback > 0 ? lookback : DEFAULT_SERVICE_ENGINE_FILL_LOOKBACK_HOURS;
   }
 
   getDefaultQuery(): Partial<DataSourceQuery> {
@@ -213,32 +226,138 @@ export class DataSource extends DataSourceApi<DataSourceQuery, SGApiDataSourceOp
     };
   }
 
-  async queryArchiveValues(query: DataSourceQuery, from: string, to: string): Promise<DataFrame[]> {
+  /** Archive samples per variable, in the order the API returned them. */
+  private async fetchArchiveSeries(
+    query: DataSourceQuery,
+    origin: DataOrigin.DataStorage | DataOrigin.ServiceEngine,
+    from: string,
+    to: string
+  ): Promise<ArchiveSeries[]> {
     const path = `/api/v2/datasources/${query.datasourceId}/archives/${query.archiveFilter.archiveId}/query`;
     const body = {
       variableFilter: { variableNames: query.archiveFilter.variables },
       timeFilter: { from, to, type: 'Absolute' },
-      origin: query.archiveFilter.origin,
+      origin,
     };
     const data = await this.request<any>(path, 'POST', body);
     if (!data || !Array.isArray(data.variables)) {
       throw new Error(INVALID_FORMAT);
     }
 
-    return data.variables.map((entry: any) => {
+    return data.variables.map((entry: any): ArchiveSeries => {
       const name = entry?.archiveVariable?.variableName;
       if (name === undefined) {
         throw new Error(INVALID_FORMAT);
       }
       const values: any[] = entry.values ?? [];
-      return createDataFrame({
+      return {
+        name,
+        values: values.map((v) => toNumber(v.value)),
+        times: values.map((v) => toTime(v.timestamp)),
+      };
+    });
+  }
+
+  private toArchiveFrames(query: DataSourceQuery, series: ArchiveSeries[], notices: QueryResultMetaNotice[] = []) {
+    return series.map((s) =>
+      createDataFrame({
         refId: query.refId,
         fields: [
-          { name, type: FieldType.number, values: values.map((v) => toNumber(v.value)) },
-          { name: 'time', type: FieldType.time, values: values.map((v) => toTime(v.timestamp)) },
+          { name: s.name, type: FieldType.number, values: s.values },
+          { name: 'time', type: FieldType.time, values: s.times },
         ],
+        ...(notices.length > 0 ? { meta: { notices } } : {}),
+      })
+    );
+  }
+
+  async queryArchiveValues(query: DataSourceQuery, from: string, to: string): Promise<DataFrame[]> {
+    if (query.archiveFilter.origin === DataOrigin.DataStorageWithServiceEngineFill) {
+      return this.queryArchiveWithServiceEngineFill(query, from, to);
+    }
+    const origin =
+      query.archiveFilter.origin === DataOrigin.ServiceEngine ? DataOrigin.ServiceEngine : DataOrigin.DataStorage;
+    return this.toArchiveFrames(query, await this.fetchArchiveSeries(query, origin, from, to));
+  }
+
+  /**
+   * Data Storage first, then the tail it does not have yet from the Service Engine.
+   *
+   * The Service Engine archive is a store-and-forward buffer that drains into Data Storage, so
+   * what Data Storage lacks is the newest data. The cut-off is the newest Data Storage sample
+   * across all queried variables (how far forwarding has got); only samples after it are read
+   * from the Service Engine, and never more than `serviceEngineFillLookbackHours` back from the
+   * range end, to protect the plant Service Engine and the WAN. A Service Engine failure does not
+   * fail the panel: the Data Storage data is returned with a warning.
+   */
+  async queryArchiveWithServiceEngineFill(query: DataSourceQuery, from: string, to: string): Promise<DataFrame[]> {
+    const stored = await this.fetchArchiveSeries(query, DataOrigin.DataStorage, from, to);
+
+    const fromMs = Date.parse(from);
+    const toMs = Date.parse(to);
+    let newest: number | null = null;
+    for (const s of stored) {
+      for (const t of s.times) {
+        if (t !== null && (newest === null || t > newest)) {
+          newest = t;
+        }
+      }
+    }
+
+    const lookbackStart = toMs - this.serviceEngineFillLookbackHours * 3_600_000;
+    const wanted = newest ?? fromMs; // where the missing tail starts
+    const cutoff = Math.max(wanted, fromMs, lookbackStart);
+    // Samples exactly at the cut-off are already in Data Storage when the cut-off is its newest sample.
+    const exclusive = newest !== null && cutoff === newest;
+
+    if (cutoff >= toMs) {
+      return this.toArchiveFrames(query, stored);
+    }
+
+    const notices: QueryResultMetaNotice[] = [];
+    if (lookbackStart > wanted && lookbackStart > fromMs) {
+      notices.push({
+        severity: 'warning',
+        text:
+          `Data Storage has no data after ${newest === null ? 'the range start' : new Date(newest).toISOString()}; ` +
+          `the Service Engine fill only covers the last ${this.serviceEngineFillLookbackHours} h.`,
       });
-    });
+    }
+
+    let engine: ArchiveSeries[];
+    try {
+      engine = await this.fetchArchiveSeries(query, DataOrigin.ServiceEngine, new Date(cutoff).toISOString(), to);
+    } catch (err) {
+      notices.push({
+        severity: 'warning',
+        text: 'Service Engine fill unavailable, showing Data Storage only. ' + toErrorMessage(err),
+      });
+      return this.toArchiveFrames(query, stored, notices);
+    }
+
+    const byName = new Map<string, ArchiveSeries>(
+      stored.map((s) => [s.name, { ...s, values: [...s.values], times: [...s.times] }])
+    );
+    let filled = 0;
+    for (const s of engine) {
+      const into: ArchiveSeries = byName.get(s.name) ?? { name: s.name, values: [], times: [] };
+      byName.set(s.name, into);
+      s.times.forEach((t, i) => {
+        if (t !== null && (exclusive ? t > cutoff : t >= cutoff)) {
+          into.times.push(t);
+          into.values.push(s.values[i]);
+          filled++;
+        }
+      });
+    }
+
+    if (filled > 0) {
+      notices.push({
+        severity: 'info',
+        text: `Values after ${new Date(cutoff).toISOString()} come from the Service Engine (not yet in Data Storage).`,
+      });
+    }
+    return this.toArchiveFrames(query, [...byName.values()], notices);
   }
 
   async queryOnlineValues(query: DataSourceQuery): Promise<DataFrame[]> {
@@ -365,14 +484,19 @@ export class DataSource extends DataSourceApi<DataSourceQuery, SGApiDataSourceOp
       throw new Error('Query Error: Could not parse list of archives');
     }
 
+    const required =
+      origin === DataOrigin.DataStorageWithServiceEngineFill
+        ? [DataOrigin.DataStorage, DataOrigin.ServiceEngine]
+        : [origin];
     const archives: Option[] = [];
     const extract = (list: any[], aggregated: boolean) => {
       for (const arch of list) {
         if (!('identification' in arch) || !('name' in arch)) {
           throw new Error('Query Error: Unknown/Invalid format');
         }
-        // only list the archive if it exists in the selected data origin
-        if ((arch.dataOrigin as string[] | undefined)?.includes(origin)) {
+        // only list the archive if it exists in the selected data origin(s)
+        const available = (arch.dataOrigin as string[] | undefined) ?? [];
+        if (required.every((o) => available.includes(o))) {
           archives.push({ label: (aggregated ? '- aggregated - ' : '') + arch.name, value: arch.identification });
         }
         if (Array.isArray(arch.aggregatedArchives)) {

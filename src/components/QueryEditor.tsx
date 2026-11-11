@@ -37,6 +37,11 @@ const QUERY_TYPES: Array<SelectableValue<DataSourceQueryType>> = [
 const DATA_ORIGINS: Array<SelectableValue<DataOrigin>> = [
   { label: 'Data Storage', value: DataOrigin.DataStorage },
   { label: 'Service Engine', value: DataOrigin.ServiceEngine },
+  {
+    label: 'Data Storage + SE fill',
+    value: DataOrigin.DataStorageWithServiceEngineFill,
+    description: 'Data Storage, plus the newest data not yet forwarded, read from the Service Engine',
+  },
 ];
 
 /** Names of dashboard query variables of this plugin with the given variable-query type. */
@@ -262,9 +267,13 @@ export class QueryEditor extends Component<Props, State> {
             />
           </InlineField>
           {query.queryType === DataSourceQueryType.ArchiveData && (
-            <InlineField label="Origin" labelWidth={10}>
+            <InlineField
+              label="Origin"
+              labelWidth={10}
+              tooltip="Data Storage + SE fill: archives present in both origins only; the Service Engine part is limited by the datasource's look-back setting"
+            >
               <Select
-                width={20}
+                width={28}
                 options={DATA_ORIGINS}
                 value={DATA_ORIGINS.find((o) => o.value === archiveFilter.origin)}
                 onChange={(v) => this.change({ archiveFilter: { ...archiveFilter, origin: v.value! } })}

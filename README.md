@@ -127,6 +127,11 @@ In order that the Datasource can authenticate requests at the IIoT Services API,
 This is done by checking the option "Forward OAuth Identity" in the Datasource configuration.
 For the URL use the respective url of the IIoT API in the form `https://<domain-of-iiot-services>:<port-of-iiot-services>/iiot-api`.
 
+| Setting | Description | Default |
+| - | - | - |
+| Show offline datasources | List zenon datasources whose origins are all unavailable | off |
+| Service Engine fill look-back (h) | For Origin `Data Storage + SE fill`: the longest window, counted back from the end of the time range, that is read from the Service Engine | 24 |
+
 ## Using the Datasource to query data
 
 To create data queries, this datasource provides a query editor with the following options:
@@ -135,6 +140,7 @@ To create data queries, this datasource provides a query editor with the followi
 | - | - | - |
 | Datasource | Selection of the available zenon Datasources for the current user |
 | Query Type | Selection of the desired data request (`Archive Data` \| `Online Values` \| `Alarms` \| `Events`) |
+| Origin | Where archive data is read from: `Data Storage`, `Service Engine`, or `Data Storage + SE fill` (see below) | only available for Query Type `Archive Data` |
 | Archive | Selection of available archive for the selected zenon Datasource | only available for Query Type `Archive Data` |
 | Variable | Selection of available variables for the selected zenon Datasource and archive. Typing narrows the list to variables whose name contains the text (case-insensitive, `*` as wildcard) | only available for Query Type `Archive Data` |
 | Variable Filter | Allows filtering the resulting data for a specific variable. The filter allows to use an `*` as wildcard. Typing narrows the variable list on the server: `INV` requests `*INV*`, `INV*PAC` requests `*INV*PAC*` | only available for Query Types `Alarms`, `Events` and `Online Values`|
@@ -142,6 +148,24 @@ To create data queries, this datasource provides a query editor with the followi
 | Only Cleared | Only cleared alarms are shown | only available for Query Types `Alarms` |
 | Only Active | Only unacknowledged alarms are shown | only available for Query Types `Alarms` |
  
+
+### Origin `Data Storage + SE fill`
+
+Reads the archive from Data Storage, then fills the newest data that has not been forwarded to
+Data Storage yet from the Service Engine. The plugin does this itself; the API is called twice
+with the normal origins.
+
+1. Query Data Storage for the whole time range.
+2. Take the newest Data Storage sample across all queried variables as the cut-off.
+3. If the cut-off is before the end of the range, query the Service Engine from the cut-off to the
+   end, but never further back than the *Service Engine fill look-back* (default 24 h).
+4. Append the Service Engine samples newer than the cut-off. Nothing older is taken from the
+   Service Engine, so the two sources never overlap.
+
+The panel shows an info notice when Service Engine data was used, and a warning when the look-back
+cut the window short or the Service Engine could not be reached (the Data Storage data is still
+shown). Gaps in the middle of the range are not filled. Only archives available in both origins
+are listed.
 
 The following images show the query editor for the different Query Types.
 
