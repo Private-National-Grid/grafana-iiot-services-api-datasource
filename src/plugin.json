@@ -1,31 +1,36 @@
 {
-    "type": "datasource",
-    "name": "zenon IIoT Services Datasource",
-    "id": "copadata-iiot-services-datasource",
-    "metrics": true,
-    "info": {
-        "description": "Datasource for requesting data from zenon IIoT Services API",
-        "author": {
-            "name": "Ing. Punzenberger COPA-DATA GmbH",
-            "url": "www.copadata.com"
-        },
-        "keywords": [
-            "service grid",
-            "copadata",
-            "copa data",
-            "iiot services"
-        ],
-        "logos": {
-            "small": "img/cd-logo.svg",
-            "large": "img/cd-logo.svg"
-        },
-        "links": [{ "name": "Project site", "url": "https://github.com/COPA-DATA/grafana-iiot-services-api-datasource" }],
-        "screenshots": [],
-        "version": "%VERSION%",
-        "updated": "%TODAY%"
+  "$schema": "https://raw.githubusercontent.com/grafana/grafana/main/docs/sources/developers/plugins/plugin.schema.json",
+  "type": "datasource",
+  "name": "zenon IIoT Services (PNG)",
+  "id": "png-iiot-services-datasource",
+  "metrics": true,
+  "info": {
+    "description": "Archive data, online values, alarms and events from the zenon IIoT Services API",
+    "author": {
+      "name": "PNG (Private National Grid)",
+      "url": "https://github.com/Private-National-Grid"
     },
-    "dependencies": {
-        "grafanaVersion": "8.3.x",
-        "plugins": []
-    }
+    "keywords": ["zenon", "iiot services", "scada", "datasource"],
+    "logos": {
+      "small": "img/logo.svg",
+      "large": "img/logo.svg"
+    },
+    "links": [
+      {
+        "name": "Source",
+        "url": "https://github.com/Private-National-Grid/grafana-iiot-services-api-datasource"
+      },
+      {
+        "name": "Original plugin (COPA-DATA)",
+        "url": "https://github.com/COPA-DATA/grafana-iiot-services-api-datasource"
+      }
+    ],
+    "screenshots": [],
+    "version": "%VERSION%",
+    "updated": "%TODAY%"
+  },
+  "dependencies": {
+    "grafanaDependency": ">=13.1.0",
+    "plugins": []
+  }
 }

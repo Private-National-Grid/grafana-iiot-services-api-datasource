@@ -1,18 +1,33 @@
-# IIoT Services API Datasource for Grafana
+# zenon IIoT Services Datasource for Grafana (PNG fork)
 
-This Datasource provides support for COPA-DATA's IIoT Services API to request metrics from IIoT Services installations.
+Grafana datasource for COPA-DATA's zenon IIoT Services API: historic (archive) values, online values,
+alarms and events.
 
-**Important: The source code of the datasource and the respective documentation is provided as is and is not covered by COPA-DATA's support and product lifecycle. You can re-use and modify the code as desired under the conditions of the MIT license. Please especially note the exclusion of any warranty and liability in case of any problems or damage resulting from this software, as stated in the MIT license.**
+This is **PNG's maintained fork** of
+[COPA-DATA/grafana-iiot-services-api-datasource](https://github.com/COPA-DATA/grafana-iiot-services-api-datasource),
+which is no longer maintained. Differences from upstream:
 
-For general information on the IIoT Services and the involved components, please refer to https://www.copadata.com/en/ or sales@copadata.com.
-The online documentation for the zenon software platform is available via https://onlinehelp.copadata.com/
+| | Upstream (1.3.0) | This fork (2.x) |
+| --- | --- | --- |
+| Plugin id | `copadata-iiot-services-datasource` | `png-iiot-services-datasource` |
+| Tooling | `@grafana/toolkit` (Grafana 8.3) | `@grafana/create-plugin` (Grafana 13) |
+| Grafana | `>= 8.3` | `>= 13.1` |
+| Distribution | `dist/` committed to git | versioned GitHub Releases (zip + SHA-256), built by CI |
+
+The query model is unchanged, so dashboards built with the upstream plugin keep working once their
+datasource `type` is changed to `png-iiot-services-datasource` (see [CHANGELOG](CHANGELOG.md)).
+
+> **Note:** the upstream code was provided by COPA-DATA "as is", not covered by COPA-DATA's support and
+> product lifecycle, under the MIT license. This fork is not affiliated with or supported by COPA-DATA.
+
+For the zenon software platform documentation see https://onlinehelp.copadata.com/
 
 
 ## Prerequisites
 The following prerequisites need to be met in order to use this datasource:
 - working IIoT Services (Service Grid) installation with IIoT Services (Service Grid) API >= 12.0.2307.4002  
 **Hint:** For versions prior 12.0, you can use this latest version of the datasource demo code, but please refer to the configuration instructions for version 1.2.0 of the datasource plugin (https://github.com/COPA-DATA/grafana-iiot-services-api-datasource/tree/v1.2.0)
-- Grafana Version >= 8.3.0
+- Grafana >= 13.1
 
 
 
@@ -27,11 +42,14 @@ To show alarm and event entries, the usage of Grafana's table panel is recommend
 
 
 ## Installation
-To use this datasource, perform the following steps:
-
-1. Clone this git repository to a local folder, or download a copy of it as ZIP file
-2. Install the plugin by manually copying the folder `dist` to Grafana's plugin folder (e.g. `.../grafana/data/plugins/`). You may rename `dist` as you like.<br>
-See https://grafana.com/docs/plugins/installation/ for reference
+1. Download `png-iiot-services-datasource-<version>.zip` from the
+   [Releases](https://github.com/Private-National-Grid/grafana-iiot-services-api-datasource/releases) page and
+   check it against the `.sha256` file published next to it.
+2. Unzip it into Grafana's plugin folder (e.g. `/var/lib/grafana/plugins/`), giving
+   `.../plugins/png-iiot-services-datasource/`.
+3. The plugin is unsigned, so allow it explicitly:
+   `GF_PLUGINS_ALLOW_LOADING_UNSIGNED_PLUGINS=png-iiot-services-datasource`
+   (or `allow_loading_unsigned_plugins` in `grafana.ini`).
 
 
 ## Configuration
@@ -91,7 +109,7 @@ allow_sign_up=true
 send_client_credentials_via_post=true
 
 [plugins]
-allow_loading_unsigned_plugins=copadata-iiot-services-datasource
+allow_loading_unsigned_plugins=png-iiot-services-datasource
 ```
 
 **Hint:** When Grafana is being operated using Docker, please refer to the Grafana documentation (https://grafana.com/docs/grafana/latest/installation/configure-docker/) how to provide configuration options via environment variables.
@@ -152,24 +170,31 @@ The datasource supports 4 different kinds of template variables:
 ### Filtering
 With the field "Filter values" you can apply a regex filter to reduce the set of available values to select from in the Grafana dashboard.
 
-# Building the Datasource
+# Development
 
-## Preparation
-- Development Environment, which supports Debugging of Chrome Webpages (e.g. Visual Studio Code)
-- Development tools:
-    - node: >= 16
-    - npm: >= 8
-    - yarn (install via npm)
+Scaffolded with [`@grafana/create-plugin`](https://grafana.com/developers/plugin-tools/). Files under
+`.config/` are managed by create-plugin; update them with `npx @grafana/create-plugin@latest update`
+rather than editing them.
 
-## Build Steps
+Requires Node.js 22+ (see `.nvmrc`) and Docker for the local Grafana.
 
-1. Clone this git repository to a local folder
-2. Open the folder in an IDE (e.g. VS Code)
-3. Run `yarn install`
-4. Build the datasource in development mode by running `yarn dev` or `yarn build`
-5. Install the datasource by copying the `dist` folder to Grafana's plugin folder.<br> You can also create a static link from the Grafana plugin folder to the local `dist` folder.  
-    On Windows use the following command: `new-item -path "C:\Program Files\GrafanaLabs\grafana\data\plugins\copadata-iiot-services-datasource" -ItemType SymbolicLink -Value C:\<path-to-repository>\dist\`  
-    This way there is no need for a copy step and changes to the sources are directly reflected after a rebuild.<br>See https://grafana.com/docs/plugins/installation/ for reference.
+```bash
+npm ci               # install (lifecycle scripts are disabled by .npmrc)
+npm run dev          # build in watch mode into dist/
+npm run server       # Grafana with the plugin mounted, at http://localhost:3000
+npm run typecheck && npm run lint && npm run test:ci
+npm run build        # production build into dist/
+npm run e2e          # Playwright smoke tests against `npm run server`
+```
+
+## Releasing
+
+1. Bump `version` in `package.json` (and `package-lock.json`) and add a `CHANGELOG.md` entry.
+2. Merge to `master`, then tag: `git tag v2.0.1 && git push origin v2.0.1`.
+3. The *Release* workflow builds, tests, and publishes
+   `png-iiot-services-datasource-<version>.zip` plus `.zip.sha256` as a GitHub Release.
+
+The tag must match `package.json`'s version or the release job fails.
 
 
 # Troubleshooting
