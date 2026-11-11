@@ -14,6 +14,11 @@ export enum DataSourceQueryType {
 export enum DataOrigin {
   ServiceEngine = 'ServiceEngine',
   DataStorage = 'DataStorage',
+  /**
+   * Plugin-side mode, never sent to the API: read Data Storage, then fill the tail that has not
+   * been forwarded yet from the Service Engine (see DataSource.queryArchiveWithServiceEngineFill).
+   */
+  DataStorageWithServiceEngineFill = 'DataStorageWithServiceEngineFill',
 }
 
 export enum TemplateVariableQueryType {
@@ -70,7 +75,11 @@ export const defaultVariableQuery: Partial<TemplateVariableQuery> = {
 
 export interface SGApiDataSourceOptions extends DataSourceJsonData {
   showOfflineDatasources?: boolean;
+  /** Longest window (hours, counted back from the range end) the Service Engine fill may read. */
+  serviceEngineFillLookbackHours?: number;
 }
+
+export const DEFAULT_SERVICE_ENGINE_FILL_LOOKBACK_HOURS = 24;
 
 /** A label/value pair as returned by the find* lookups. */
 export interface Option {

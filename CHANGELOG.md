@@ -1,3 +1,13 @@
+# 2.1.0
+
+### Features
+* New archive Origin **Data Storage + SE fill**: reads Data Storage, then fills the tail not yet
+  forwarded to Data Storage from the Service Engine (samples after the newest Data Storage sample
+  only). The Service Engine window is capped by the new datasource setting *Service Engine fill
+  look-back* (default 24 h). A Service Engine failure leaves the Data Storage data in the panel
+  with a warning; panels show a notice when Service Engine data was used. Only archives available
+  in both origins are listed for this origin.
+
 # 2.0.0
 
 PNG fork of the COPA-DATA plugin. **Breaking:** new plugin id.

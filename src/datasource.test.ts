@@ -221,6 +221,115 @@ describe('DataSource.query', () => {
   });
 });
 
+describe('DataSource archive query with Service Engine fill', () => {
+  const T = (hhmm: string) => `2026-01-01T${hhmm}:00Z`;
+  const series = (name: string, samples: Array<[string, number]>) => ({
+    archiveVariable: { variableName: name },
+    values: samples.map(([timestamp, value]) => ({ timestamp, value })),
+  });
+  const fillQuery = (variables = ['V1', 'V2']) =>
+    request([
+      {
+        datasourceId: 'ds1',
+        queryType: DataSourceQueryType.ArchiveData,
+        archiveFilter: { origin: DataOrigin.DataStorageWithServiceEngineFill, archiveId: 'AR1', variables },
+      },
+    ]);
+  const field = (frame: any, i: number) => frame.fields[i].values;
+
+  it('does not ask the Service Engine when Data Storage reaches the range end', async () => {
+    fetchMock.mockReturnValueOnce(respond({ variables: [series('V1', [['2026-01-02T00:00:00Z', 1]])] }));
+    const res = await makeDataSource().query(fillQuery(['V1']));
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls[0][0].data.origin).toBe('DataStorage');
+    expect(field(res.data[0], 0)).toEqual([1]);
+    expect(res.data[0].meta).toBeUndefined();
+  });
+
+  it('fills only the tail after the newest Data Storage sample', async () => {
+    fetchMock
+      .mockReturnValueOnce(
+        respond({
+          variables: [
+            series('V1', [
+              [T('19:00'), 1],
+              [T('20:00'), 2],
+            ]),
+            series('V2', [[T('18:00'), 5]]), // rarely changes
+          ],
+        })
+      )
+      .mockReturnValueOnce(
+        respond({
+          variables: [
+            series('V1', [
+              [T('20:00'), 2],
+              [T('21:00'), 3],
+            ]),
+            series('V2', [[T('22:00'), 6]]),
+          ],
+        })
+      );
+
+    const res = await makeDataSource().query(fillQuery());
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock.mock.calls[1][0].data).toEqual({
+      variableFilter: { variableNames: ['V1', 'V2'] },
+      timeFilter: { from: '2026-01-01T20:00:00.000Z', to: '2026-01-02T00:00:00.000Z', type: 'Absolute' },
+      origin: 'ServiceEngine',
+    });
+    const [v1, v2] = res.data;
+    expect(field(v1, 0)).toEqual([1, 2, 3]); // the 20:00 overlap is not duplicated
+    expect(field(v1, 1)).toEqual([Date.parse(T('19:00')), Date.parse(T('20:00')), Date.parse(T('21:00'))]);
+    expect(field(v2, 0)).toEqual([5, 6]);
+    expect(v1.meta.notices).toEqual([expect.objectContaining({ severity: 'info' })]);
+  });
+
+  it('caps the Service Engine window at the configured look-back', async () => {
+    fetchMock
+      .mockReturnValueOnce(respond({ variables: [series('V1', [])] }))
+      .mockReturnValueOnce(
+        respond({
+          variables: [
+            series('V1', [
+              [T('22:00'), 7],
+              [T('23:00'), 8],
+            ]),
+          ],
+        })
+      );
+
+    const res = await makeDataSource({ serviceEngineFillLookbackHours: 2 }).query(fillQuery(['V1']));
+
+    expect(fetchMock.mock.calls[1][0].data.timeFilter.from).toBe('2026-01-01T22:00:00.000Z');
+    expect(field(res.data[0], 0)).toEqual([7, 8]); // sample at the cut-off is kept: Data Storage had none
+    expect(res.data[0].meta.notices.map((n: any) => n.severity)).toEqual(['warning', 'info']);
+  });
+
+  it('returns Data Storage data with a warning when the Service Engine fails', async () => {
+    fetchMock
+      .mockReturnValueOnce(respond({ variables: [series('V1', [[T('20:00'), 2]])] }))
+      .mockReturnValueOnce(throwError(() => ({ status: 503, statusText: 'Service Unavailable', data: {} })));
+
+    const res = await makeDataSource().query(fillQuery(['V1']));
+
+    expect(field(res.data[0], 0)).toEqual([2]);
+    expect(res.data[0].meta.notices).toEqual([
+      expect.objectContaining({
+        severity: 'warning',
+        text: expect.stringContaining('Service Engine fill unavailable'),
+      }),
+    ]);
+  });
+
+  it('still fails the panel when Data Storage fails', async () => {
+    fetchMock.mockReturnValueOnce(throwError(() => ({ status: 500, statusText: 'Internal Server Error', data: {} })));
+    await expect(makeDataSource().query(fillQuery(['V1']))).rejects.toThrow('Query Error');
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+});
+
 describe('DataSource lookups', () => {
   it('hides offline datasources unless configured', async () => {
     const payload = {
@@ -254,6 +363,21 @@ describe('DataSource lookups', () => {
     expect(await makeDataSource().findArchives('ds1')).toEqual([
       { label: '- aggregated - Alpha', value: 'A' },
       { label: 'Zeta', value: 'Z' },
+    ]);
+  });
+
+  it('lists only archives present in both origins for the Service Engine fill', async () => {
+    fetchMock.mockReturnValue(
+      respond({
+        archives: [
+          { identification: 'B', name: 'Both', dataOrigin: ['DataStorage', 'ServiceEngine'] },
+          { identification: 'D', name: 'DS only', dataOrigin: ['DataStorage'] },
+          { identification: 'S', name: 'SE only', dataOrigin: ['ServiceEngine'] },
+        ],
+      })
+    );
+    expect(await makeDataSource().findArchives('ds1', DataOrigin.DataStorageWithServiceEngineFill)).toEqual([
+      { label: 'Both', value: 'B' },
     ]);
   });
 
