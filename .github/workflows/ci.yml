@@ -17,6 +17,7 @@ jobs:
   build:
     name: Build, lint and unit tests
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     outputs:
       plugin-id: ${{ steps.metadata.outputs.plugin-id }}
       plugin-version: ${{ steps.metadata.outputs.plugin-version }}
@@ -43,6 +44,7 @@ jobs:
         run: npm run lint
       - name: Unit tests
         run: npm run test:ci
+        timeout-minutes: 5
       - name: Build frontend
         run: npm run build
 

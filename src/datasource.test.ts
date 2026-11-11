@@ -22,10 +22,11 @@ import {
 const fetchMock = jest.fn();
 const replaceMock = jest.fn((target?: string) => target ?? '');
 
+// Fully mocked: loading the real @grafana/runtime in Jest leaves handles open and the run never exits.
 jest.mock('@grafana/runtime', () => ({
-  ...jest.requireActual('@grafana/runtime'),
   getBackendSrv: () => ({ fetch: fetchMock }),
   getTemplateSrv: () => ({ replace: replaceMock, getVariables: () => [] }),
+  isFetchError: (e: unknown) => typeof e === 'object' && e !== null && 'status' in e && 'data' in e,
 }));
 
 const respond = (data: unknown) => of({ data, status: 200, ok: true });
